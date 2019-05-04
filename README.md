@@ -1,11 +1,7 @@
-# Soil Moisture Sensing System
-##Soil Moisture Sensor Interfaced with ARM (LPC2129) microcontroller 
+## Soil Moisture Sensing System
+Soil Moisture Sensor Interfaced with ARM (LPC2129) microcontroller 
 
 
- 
-  
-  Environment Used- Keil MicroVision 5**
-  
  
  ## Hardware Used
 * [Microcontroller Used : ARM LPC2129] (microcontroller-used-arm-LPC2129)
