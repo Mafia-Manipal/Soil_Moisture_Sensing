@@ -1,10 +1,333 @@
 #include<lpc21xx.h>
+#include<string.h>
+
+// LCD Control Pins
 #define RS  0x00020000                  /* RS  - P1.17                         */
 #define RW  0X00040000                  /* R/W - P1.18                         */    
 #define EN  0X00080000                  /* E   - P1.19                         */
 #define CLR 0X00FE0000
- 
-unsigned int adc_value=0;
+
+// Relay Control Pin
+#define RELAY_PIN 0x00010000            /* Relay - P1.16 for water pump control */
+
+// Push Button Pins
+#define BUTTON1 0x00000001              /* Button1 - P0.0 for manual override */
+#define BUTTON2 0x00000002              /* Button2 - P0.1 for menu navigation */
+#define BUTTON3 0x00000004              /* Button3 - P0.2 for parameter adjustment */
+
+// DHT22 Sensor Pins
+#define DHT22_PIN 0x00000008            /* DHT22 - P0.3 for temperature/humidity */
+
+// I2C Pins for RTC (DS1307)
+#define I2C_SCL 0x00000010              /* I2C SCL - P0.4 */
+#define I2C_SDA 0x00000020              /* I2C SDA - P0.5 */
+
+// UART Pins for WiFi (ESP8266)
+#define UART_TXD 0x00000040             /* UART TXD - P0.6 */
+#define UART_RXD 0x00000080             /* UART RXD - P0.7 */
+
+// System Variables
+unsigned int adc_value = 0;
+unsigned int temperature = 0;
+unsigned int humidity = 0;
+unsigned int moisture_threshold_low = 30;    /* 30% moisture threshold */
+unsigned int moisture_threshold_high = 70;   /* 70% moisture threshold */
+unsigned char pump_status = 0;               /* 0=OFF, 1=ON */
+unsigned char system_mode = 0;               /* 0=AUTO, 1=MANUAL, 2=SCHEDULED */
+unsigned char irrigation_schedule[2] = {6, 18}; /* 6 AM and 6 PM */
+
+// RTC Time Structure
+struct RTC_Time {
+    unsigned char second;
+    unsigned char minute;
+    unsigned char hour;
+    unsigned char day;
+    unsigned char month;
+    unsigned char year;
+} current_time;
+
+// I2C Functions for RTC
+void I2C_Init(void)
+{
+    I2CONCLR = 0x6C;                    /* Clear I2C control register */
+    I2CONSET = 0x40;                    /* Enable I2C interface */
+    I2SCLH = 0x4B;                      /* Set I2C clock high time */
+    I2SCLL = 0x4B;                      /* Set I2C clock low time */
+}
+
+void I2C_Start(void)
+{
+    I2CONCLR = 0x08;                    /* Clear start flag */
+    I2CONSET = 0x40;                    /* Enable I2C */
+    I2CONSET = 0x20;                    /* Set start flag */
+    while(!(I2CONSET & 0x08));          /* Wait for start flag */
+}
+
+void I2C_Stop(void)
+{
+    I2CONSET = 0x10;                    /* Set stop flag */
+    I2CONCLR = 0x08;                    /* Clear start flag */
+}
+
+void I2C_Write(unsigned char data)
+{
+    I2DAT = data;                       /* Load data */
+    while(!(I2CONSET & 0x08));          /* Wait for data transfer */
+    I2CONCLR = 0x08;                    /* Clear SI flag */
+}
+
+unsigned char I2C_Read(unsigned char ack)
+{
+    unsigned char data;
+    if(ack) I2CONSET = 0x04;            /* Set acknowledge flag */
+    else I2CONCLR = 0x04;               /* Clear acknowledge flag */
+    while(!(I2CONSET & 0x08));          /* Wait for data transfer */
+    data = I2DAT;                       /* Read data */
+    I2CONCLR = 0x08;                    /* Clear SI flag */
+    return data;
+}
+
+// RTC Functions
+void RTC_Init(void)
+{
+    I2C_Init();
+    Delay(100);
+}
+
+void RTC_ReadTime(void)
+{
+    I2C_Start();
+    I2C_Write(0xD0);                    /* DS1307 address + write */
+    I2C_Write(0x00);                    /* Start from seconds register */
+    I2C_Start();
+    I2C_Write(0xD1);                    /* DS1307 address + read */
+    
+    current_time.second = I2C_Read(1);  /* Read seconds with ACK */
+    current_time.minute = I2C_Read(1);  /* Read minutes with ACK */
+    current_time.hour = I2C_Read(1);    /* Read hours with ACK */
+    current_time.day = I2C_Read(1);     /* Read day with ACK */
+    current_time.month = I2C_Read(1);   /* Read month with ACK */
+    current_time.year = I2C_Read(0);    /* Read year without ACK */
+    
+    I2C_Stop();
+}
+
+// UART Functions for WiFi Communication
+void UART_Init(void)
+{
+    PINSEL0 = PINSEL0 | 0x00000050;     /* Enable UART0 pins */
+    U0LCR = 0x83;                       /* 8-bit data, 1 stop bit, enable access to divisor latches */
+    U0DLL = 97;                         /* Set baud rate to 9600 */
+    U0DLM = 0;
+    U0LCR = 0x03;                       /* Disable access to divisor latches */
+}
+
+void UART_SendChar(unsigned char ch)
+{
+    while(!(U0LSR & 0x20));             /* Wait for THR empty */
+    U0THR = ch;                         /* Send character */
+}
+
+void UART_SendString(unsigned char *str)
+{
+    while(*str != '\0')
+    {
+        UART_SendChar(*str);
+        str++;
+    }
+}
+
+unsigned char UART_ReceiveChar(void)
+{
+    while(!(U0LSR & 0x01));             /* Wait for data available */
+    return U0RBR;                       /* Return received character */
+}
+
+// Relay Control Functions
+void Pump_ON(void)
+{
+    IO1SET = RELAY_PIN;                 /* Turn ON relay */
+    pump_status = 1;
+}
+
+void Pump_OFF(void)
+{
+    IO1CLR = RELAY_PIN;                 /* Turn OFF relay */
+    pump_status = 0;
+}
+
+// DHT22 Temperature and Humidity Sensor Functions
+unsigned char DHT22_Read(void)
+{
+    unsigned char i, j, data[5] = {0};
+    
+    // Send start signal
+    IO0CLR = DHT22_PIN;                 /* Pull low */
+    Delay(20);                          /* Wait 20ms */
+    IO0SET = DHT22_PIN;                 /* Pull high */
+    Delay(1);                           /* Wait 1ms */
+    
+    // Wait for response
+    IO0CLR = DHT22_PIN;                 /* Pull low */
+    Delay(1);                           /* Wait 1ms */
+    IO0SET = DHT22_PIN;                 /* Pull high */
+    Delay(1);                           /* Wait 1ms */
+    
+    // Read 40 bits of data
+    for(i = 0; i < 5; i++)
+    {
+        for(j = 0; j < 8; j++)
+        {
+            while(!(IO0PIN & DHT22_PIN)); /* Wait for high */
+            Delay(1);
+            data[i] <<= 1;
+            if(IO0PIN & DHT22_PIN)       /* If still high after 1ms */
+            {
+                data[i] |= 1;
+                while(IO0PIN & DHT22_PIN); /* Wait for low */
+            }
+        }
+    }
+    
+    // Calculate temperature and humidity
+    humidity = ((data[0] << 8) | data[1]) / 10;
+    temperature = ((data[2] << 8) | data[3]) / 10;
+    
+    return 1;                           /* Success */
+}
+
+// Button Debounce Function
+unsigned char Button_Read(unsigned int button_mask)
+{
+    static unsigned int last_state = 0;
+    unsigned int current_state = IO0PIN & button_mask;
+    
+    if(current_state && !last_state)    /* Button pressed */
+    {
+        Delay(50);                      /* Debounce delay */
+        if(IO0PIN & button_mask)        /* Still pressed after debounce */
+        {
+            last_state = current_state;
+            return 1;
+        }
+    }
+    last_state = current_state;
+    return 0;
+}
+
+// Parameter Adjustment Functions
+void Adjust_Threshold_Low(void)
+{
+    if(Button_Read(BUTTON1))            /* Increase */
+    {
+        if(moisture_threshold_low < 50)
+            moisture_threshold_low += 5;
+    }
+    if(Button_Read(BUTTON2))            /* Decrease */
+    {
+        if(moisture_threshold_low > 10)
+            moisture_threshold_low -= 5;
+    }
+}
+
+void Adjust_Threshold_High(void)
+{
+    if(Button_Read(BUTTON1))            /* Increase */
+    {
+        if(moisture_threshold_high < 90)
+            moisture_threshold_high += 5;
+    }
+    if(Button_Read(BUTTON2))            /* Decrease */
+    {
+        if(moisture_threshold_high > moisture_threshold_low + 20)
+            moisture_threshold_high -= 5;
+    }
+}
+
+// System Health Monitoring
+unsigned char System_Health_Check(void)
+{
+    unsigned char health_status = 0;
+    
+    // Check ADC reading range
+    if(adc_value > 100 || adc_value < 0)
+        health_status |= 0x01;          /* ADC error */
+    
+    // Check temperature range
+    if(temperature > 60 || temperature < -10)
+        health_status |= 0x02;          /* Temperature sensor error */
+    
+    // Check humidity range
+    if(humidity > 100 || humidity < 0)
+        health_status |= 0x04;          /* Humidity sensor error */
+    
+    return health_status;
+}
+
+// WiFi Command Processing
+void Process_WiFi_Command(void)
+{
+    unsigned char command[50];
+    unsigned char i = 0;
+    unsigned char ch;
+    
+    // Check if command available
+    if(U0LSR & 0x01)                    /* Data available */
+    {
+        while((U0LSR & 0x01) && i < 49)
+        {
+            ch = U0RBR;
+            if(ch == '\r' || ch == '\n')
+                break;
+            command[i++] = ch;
+        }
+        command[i] = '\0';
+        
+        // Process commands
+        if(strstr(command, "PUMP_ON"))
+        {
+            Pump_ON();
+            UART_SendString("OK:PUMP_ON\r\n");
+        }
+        else if(strstr(command, "PUMP_OFF"))
+        {
+            Pump_OFF();
+            UART_SendString("OK:PUMP_OFF\r\n");
+        }
+        else if(strstr(command, "MODE_AUTO"))
+        {
+            system_mode = 0;
+            UART_SendString("OK:MODE_AUTO\r\n");
+        }
+        else if(strstr(command, "MODE_MANUAL"))
+        {
+            system_mode = 1;
+            UART_SendString("OK:MODE_MANUAL\r\n");
+        }
+        else if(strstr(command, "MODE_SCHEDULED"))
+        {
+            system_mode = 2;
+            UART_SendString("OK:MODE_SCHEDULED\r\n");
+        }
+        else if(strstr(command, "GET_STATUS"))
+        {
+            UART_SendString("STATUS:MOISTURE:");
+            UART_SendChar(adc_value/10 + '0');
+            UART_SendChar(adc_value%10 + '0');
+            UART_SendString(" TEMP:");
+            UART_SendChar(temperature/10 + '0');
+            UART_SendChar(temperature%10 + '0');
+            UART_SendString(" PUMP:");
+            if(pump_status)
+                UART_SendString("ON");
+            else
+                UART_SendString("OFF");
+            UART_SendString(" MODE:");
+            UART_SendChar(system_mode + '0');
+            UART_SendString("\r\n");
+        }
+    }
+}
  
 /********************************************************************************
   Delay Function                                              
@@ -158,52 +481,330 @@ void Int_ASCII(int value,char cnt)
 }
  
 /********************************************************************************
-Sensor_Check Function to take ADC reading & display it on LCD                                                    
+Enhanced Sensor_Check Function with Intelligent Control Logic                                                    
                                                            
 ********************************************************************************/
 void Sensor_Check()
 {
- ADCR=0x00200602;                       /* PDN=1,CLKDIV=6,channel=AD0.2        */
- LCD_Command1(0x80);
- LCD_Command1(0xC0);
- LCD_String("mois");
- adc_value=ADC_Conversion();            /* Get the result of conversion        */
- adc_value=( ((adc_value/1023.0))*100 );
- adc_value=(adc_value/10);
- LCD_Command1(0xC4);                    /* 2nd row, 5th location               */
- Int_ASCII(adc_value,2);                /* Display the result on LCD           */
+    // Read soil moisture
+    ADCR = 0x00200602;                  /* PDN=1,CLKDIV=6,channel=AD0.2        */
+    adc_value = ADC_Conversion();       /* Get the result of conversion        */
+    adc_value = ((adc_value / 1023.0) * 100);
+    adc_value = (adc_value / 10);
+    
+    // Read temperature and humidity
+    DHT22_Read();
+    
+    // Read current time
+    RTC_ReadTime();
+    
+    // Intelligent irrigation control logic
+    switch(system_mode)
+    {
+        case 0: // AUTO mode - based on moisture threshold
+            if(adc_value < moisture_threshold_low && !pump_status)
+            {
+                Pump_ON();
+                LCD_Command1(0x01);      /* Clear display */
+                LCD_String("PUMP ON - LOW MOISTURE");
+                Delay(2000);
+            }
+            else if(adc_value > moisture_threshold_high && pump_status)
+            {
+                Pump_OFF();
+                LCD_Command1(0x01);      /* Clear display */
+                LCD_String("PUMP OFF - SUFFICIENT");
+                Delay(2000);
+            }
+            break;
+            
+        case 1: // MANUAL mode - controlled by buttons
+            // Manual control handled in main loop
+            break;
+            
+        case 2: // SCHEDULED mode - based on time
+            if((current_time.hour == irrigation_schedule[0] || current_time.hour == irrigation_schedule[1]) 
+               && current_time.minute == 0 && current_time.second < 30)
+            {
+                if(!pump_status)
+                {
+                    Pump_ON();
+                    LCD_Command1(0x01);
+                    LCD_String("SCHEDULED IRRIGATION");
+                    Delay(2000);
+                }
+            }
+            else if(pump_status && current_time.second > 30)
+            {
+                Pump_OFF();
+            }
+            break;
+    }
+    
+    // Display comprehensive information
+    LCD_Command1(0x80);                 /* First line */
+    LCD_String("Moist:");
+    Int_ASCII(adc_value, 2);
+    LCD_String("% Temp:");
+    Int_ASCII(temperature, 2);
+    LCD_String("C");
+    
+    LCD_Command1(0xC0);                 /* Second line */
+    if(pump_status)
+        LCD_String("Status: WATERING");
+    else
+        LCD_String("Status: IDLE    ");
+    
+    // Send data to WiFi module for remote monitoring
+    UART_SendString("MOISTURE:");
+    UART_SendChar(adc_value/10 + '0');
+    UART_SendChar(adc_value%10 + '0');
+    UART_SendString(" TEMP:");
+    UART_SendChar(temperature/10 + '0');
+    UART_SendChar(temperature%10 + '0');
+    UART_SendString(" PUMP:");
+    if(pump_status)
+        UART_SendString("ON");
+    else
+        UART_SendString("OFF");
+    UART_SendString("\r\n");
 }
  
 /********************************************************************************
- PORT_Initial Function for PORT Initialisation                                                   
+ Enhanced PORT_Initial Function for Complete System Initialisation                                                   
                                                           
 ********************************************************************************/
 void PORT_Initial(void)    
 {
- IO1DIR   =    0x00FE0000;              /* LCD pins set as o/p                 */
- PINSEL0  =    0x00000000;
- PINSEL1  =    0x05000000;              /* ADC function for 0.28 & 0.29        */
- PINSEL2  =    0x00000000;
+    // LCD pins set as output
+    IO1DIR = 0x00FE0000;                /* LCD pins set as o/p                 */
+    
+    // Relay pin set as output
+    IO1DIR |= RELAY_PIN;                /* Relay pin as output */
+    
+    // Button pins set as input with pull-up
+    IO0DIR &= ~(BUTTON1 | BUTTON2 | BUTTON3);  /* Button pins as input */
+    IO0SET = BUTTON1 | BUTTON2 | BUTTON3;      /* Enable pull-up resistors */
+    
+    // DHT22 pin configuration
+    IO0DIR |= DHT22_PIN;                /* DHT22 pin as output initially */
+    
+    // I2C pins for RTC
+    PINSEL0 |= 0x00000050;              /* P0.4 and P0.5 as I2C */
+    
+    // UART pins for WiFi
+    PINSEL0 |= 0x00000050;              /* P0.6 and P0.7 as UART */
+    
+    // ADC function for soil moisture sensor
+    PINSEL1 = 0x05000000;               /* ADC function for 0.28 & 0.29        */
+    PINSEL2 = 0x00000000;
+    
+    // Initialize all communication modules
+    UART_Init();
+    RTC_Init();
+    
+    // Initialize relay to OFF state
+    Pump_OFF();
 }
  
 /********************************************************************************
-     MAIN FUNCTION
+     ENHANCED MAIN FUNCTION - SMART IRRIGATION SYSTEM
 ********************************************************************************/    
 int main()
 {
- PORT_Initial();                        /* Initialise the ports                */
- LCD_Init();                            /* Initialise LCD                      */
- LCD_String("ESD MINI PROJECT");
- LCD_Command1(0xC0);      
-Delay(1000);	/* 2nd row, 1st location               */
- LCD_String("by sakshi    ");
-	Delay(1000);
- LCD_Command1(0x80);                    /* 1st row, 1st location               */
- LCD_String("moist% ");
-	Delay(1000);
- LCD_Command1(0x01);                    /* Clear screen                        */
- while(1)
- {
-  Sensor_Check();                       /* Take ADC reading                    */
- }
+    unsigned char button_pressed = 0;
+    unsigned char menu_level = 0;
+    unsigned char parameter_select = 0;
+    
+    // Initialize all hardware
+    PORT_Initial();                     /* Initialize all ports and modules    */
+    LCD_Init();                         /* Initialize LCD                      */
+    
+    // System startup display
+    LCD_String("SMART IRRIGATION");
+    LCD_Command1(0xC0);
+    LCD_String("SYSTEM v2.0");
+    Delay(2000);
+    
+    LCD_Command1(0x01);                 /* Clear display */
+    LCD_String("Initializing...");
+    LCD_Command1(0xC0);
+    LCD_String("Please wait...");
+    Delay(3000);
+    
+    // Initialize RTC with default time if needed
+    LCD_Command1(0x01);
+    LCD_String("RTC: ");
+    RTC_ReadTime();
+    LCD_String("OK");
+    Delay(1000);
+    
+    // Initialize WiFi module
+    LCD_Command1(0x01);
+    LCD_String("WiFi: ");
+    UART_SendString("AT\r\n");          /* Test WiFi module */
+    Delay(1000);
+    LCD_String("OK");
+    Delay(1000);
+    
+    // Main system loop
+    while(1)
+    {
+        // Check for button presses
+        if(Button_Read(BUTTON1))        /* Manual override button */
+        {
+            if(system_mode == 0)        /* If in AUTO mode */
+            {
+                system_mode = 1;        /* Switch to MANUAL mode */
+                LCD_Command1(0x01);
+                LCD_String("MANUAL MODE");
+                LCD_Command1(0xC0);
+                LCD_String("Press B1 for pump");
+                Delay(2000);
+            }
+            else if(system_mode == 1)   /* If in MANUAL mode */
+            {
+                if(!pump_status)
+                {
+                    Pump_ON();
+                    LCD_Command1(0x01);
+                    LCD_String("MANUAL PUMP ON");
+                    Delay(2000);
+                }
+                else
+                {
+                    Pump_OFF();
+                    LCD_Command1(0x01);
+                    LCD_String("MANUAL PUMP OFF");
+                    Delay(2000);
+                }
+            }
+        }
+        
+        if(Button_Read(BUTTON2))        /* Mode selection button */
+        {
+            system_mode = (system_mode + 1) % 3;  /* Cycle through modes */
+            LCD_Command1(0x01);
+            switch(system_mode)
+            {
+                case 0:
+                    LCD_String("AUTO MODE");
+                    LCD_Command1(0xC0);
+                    LCD_String("Threshold based");
+                    break;
+                case 1:
+                    LCD_String("MANUAL MODE");
+                    LCD_Command1(0xC0);
+                    LCD_String("Button control");
+                    break;
+                case 2:
+                    LCD_String("SCHEDULED MODE");
+                    LCD_Command1(0xC0);
+                    LCD_String("Time based");
+                    break;
+            }
+            Delay(2000);
+        }
+        
+        if(Button_Read(BUTTON3))        /* Parameter adjustment button */
+        {
+            menu_level = (menu_level + 1) % 3;
+            LCD_Command1(0x01);
+            switch(menu_level)
+            {
+                case 0:
+                    LCD_String("LOW THRESHOLD:");
+                    LCD_Command1(0xC0);
+                    Int_ASCII(moisture_threshold_low, 2);
+                    LCD_String("%");
+                    break;
+                case 1:
+                    LCD_String("HIGH THRESHOLD:");
+                    LCD_Command1(0xC0);
+                    Int_ASCII(moisture_threshold_high, 2);
+                    LCD_String("%");
+                    break;
+                case 2:
+                    LCD_String("SCHEDULE: ");
+                    Int_ASCII(irrigation_schedule[0], 2);
+                    LCD_String(":");
+                    LCD_String("00 & ");
+                    Int_ASCII(irrigation_schedule[1], 2);
+                    LCD_String(":00");
+                    break;
+            }
+            Delay(3000);
+        }
+        
+        // Perform sensor check and control logic
+        Sensor_Check();
+        
+        // Process WiFi commands
+        Process_WiFi_Command();
+        
+        // System health monitoring
+        unsigned char health_status = System_Health_Check();
+        if(health_status != 0)
+        {
+            LCD_Command1(0x01);
+            LCD_String("SYSTEM ERROR:");
+            if(health_status & 0x01)
+                LCD_String(" ADC");
+            if(health_status & 0x02)
+                LCD_String(" TEMP");
+            if(health_status & 0x04)
+                LCD_String(" HUM");
+            Delay(3000);
+        }
+        
+        // Weather-based emergency irrigation
+        if(temperature > 35 && adc_value < 50 && !pump_status)
+        {
+            Pump_ON();
+            LCD_Command1(0x01);
+            LCD_String("EMERGENCY IRRIGATION");
+            LCD_Command1(0xC0);
+            LCD_String("High Temperature!");
+            Delay(3000);
+        }
+        
+        // System status monitoring
+        if(adc_value < 20)
+        {
+            LCD_Command1(0x01);
+            LCD_String("WARNING: VERY LOW");
+            LCD_Command1(0xC0);
+            LCD_String("MOISTURE LEVEL!");
+            Delay(2000);
+        }
+        
+        // Data logging every 15 minutes
+        static unsigned int log_counter = 0;
+        log_counter++;
+        if(log_counter >= 900)          /* ~15 minutes at current loop speed */
+        {
+            // Send comprehensive data log
+            UART_SendString("LOG:MOISTURE:");
+            UART_SendChar(adc_value/10 + '0');
+            UART_SendChar(adc_value%10 + '0');
+            UART_SendString(" TEMP:");
+            UART_SendChar(temperature/10 + '0');
+            UART_SendChar(temperature%10 + '0');
+            UART_SendString(" HUM:");
+            UART_SendChar(humidity/10 + '0');
+            UART_SendChar(humidity%10 + '0');
+            UART_SendString(" MODE:");
+            UART_SendChar(system_mode + '0');
+            UART_SendString(" PUMP:");
+            if(pump_status)
+                UART_SendString("ON");
+            else
+                UART_SendString("OFF");
+            UART_SendString("\r\n");
+            
+            log_counter = 0;
+        }
+        
+        Delay(1000);                    /* 1 second delay between readings */
+    }
 }

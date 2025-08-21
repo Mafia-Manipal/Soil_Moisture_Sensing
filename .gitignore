@@ -1,0 +1,56 @@
+# Keil µVision build files
+*.uvproj
+*.uvopt
+*.uvguix.*
+*.uvguix
+*.uvguix.*.bak
+*.uvguix.*.dep
+*.uvguix.*.depend
+*.uvguix.*.log
+*.uvguix.*.tmp
+*.uvguix.*.bak
+*.uvguix.*.dep
+*.uvguix.*.depend
+*.uvguix.*.log
+*.uvguix.*.tmp
+
+# Object files
+*.o
+*.obj
+*.elf
+*.hex
+*.bin
+*.map
+*.lst
+
+# Debug files
+*.d
+*.dep
+*.depend
+*.log
+*.tmp
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Backup files
+*.bak
+*.backup
+*.old
+
+# Temporary files
+*.tmp
+*.temp
